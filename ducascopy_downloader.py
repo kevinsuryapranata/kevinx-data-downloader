@@ -112,24 +112,25 @@ def hour_url(symbol: str, dt: datetime) -> str:
     )
 
 
+# Sentinel returned by fetch_hour when Dukascopy has no data for that hour
+# (404). Distinguishable from a genuine empty list (which shouldn't occur).
+EMPTY_HOUR = object()
+
+
 def fetch_hour(symbol: str, dt: datetime, on_retry=None, on_download=None):
     """
     Download and decode one hour of ticks.
 
-    Returns a list of (timestamp, ask, bid, ask_vol, bid_vol) tuples.
-    An empty list means no ticks for that hour (weekend, holiday, etc.).
+    Returns:
+      EMPTY_HOUR sentinel  -- Dukascopy returned 404 (market closed / no data)
+      list of tuples       -- (timestamp, ask, bid, ask_vol, bid_vol)
 
-    on_retry:    optional callable(attempt, max_attempts) -- called before each retry.
-    on_download: optional callable() -- called once the response is received and
-                 we're about to decompress, so callers can update "downloading" state.
+    on_retry:    optional callable(attempt, max_attempts)
+    on_download: optional callable() -- called once response received
     """
     url = hour_url(symbol, dt)
     point = INSTRUMENTS[symbol][0]
 
-    # Retry the request a few times with growing backoff. Dukascopy
-    # occasionally responds slowly to rapid sequential requests, causing
-    # read timeouts -- a retry usually succeeds where the first try failed.
-    # VPNs make this worse; tune the constants at the top of the file.
     resp = None
     for attempt in range(1, MAX_ATTEMPTS + 1):
         try:
@@ -137,13 +138,13 @@ def fetch_hour(symbol: str, dt: datetime, on_retry=None, on_download=None):
             break
         except requests.RequestException:
             if attempt == MAX_ATTEMPTS:
-                raise                       # give up -- caller logs it
+                raise
             if on_retry:
                 on_retry(attempt, MAX_ATTEMPTS)
             time.sleep(RETRY_BACKOFF * attempt)
 
     if resp.status_code == 404:
-        return []           # no data this hour -- normal for closed markets
+        return EMPTY_HOUR       # market closed / no data for this hour
     resp.raise_for_status()
 
     if on_download:
@@ -151,14 +152,12 @@ def fetch_hour(symbol: str, dt: datetime, on_retry=None, on_download=None):
 
     raw = resp.content
     if not raw:
-        return []
+        return EMPTY_HOUR
 
-    # The file is LZMA-compressed. Empty/closed hours sometimes return tiny
-    # files that fail to decompress -- treat those as "no data".
     try:
         data = lzma.decompress(raw)
     except lzma.LZMAError:
-        return []
+        return EMPTY_HOUR
 
     ticks = []
     for ms, ask, bid, ask_vol, bid_vol in TICK_STRUCT.iter_unpack(data):
@@ -292,14 +291,15 @@ def download_day(symbol: str, day: datetime):
                 slots[slot]["since"] = time.monotonic()
 
         try:
-            ticks = fetch_hour(symbol, dt, on_retry=on_retry,
-                               on_download=on_download)
+            outcome = fetch_hour(symbol, dt, on_retry=on_retry,
+                                 on_download=on_download)
             with lock:
-                results[hour]       = ticks
-                tick_count[0]      += len(ticks)
-                completed[0]       += 1
+                results[hour] = outcome
+                n = 0 if outcome is EMPTY_HOUR else len(outcome)
+                tick_count[0]       += n
+                completed[0]        += 1
                 slots[slot]["state"] = "done"
-                slots[slot]["ticks"] = len(ticks)
+                slots[slot]["ticks"] = n
         except Exception as exc:                        # noqa: BLE001
             with lock:
                 results[hour]        = exc
@@ -337,18 +337,24 @@ def download_day(symbol: str, day: datetime):
     sys.stdout.flush()
 
     # ── collect results in hour order ────────────────────────────────────────
-    all_ticks = []
+    # hour_status: hour -> "ok" | "empty" | "failed"
+    all_ticks   = []
+    hour_status = {}
     for hour in range(total):
-        outcome = results.get(hour, [])
+        outcome = results.get(hour)
         if isinstance(outcome, Exception):
             failed_hours.append(hour)
+            hour_status[hour] = "failed"
+        elif outcome is EMPTY_HOUR:
+            hour_status[hour] = "empty"
         else:
             all_ticks.extend(outcome)
+            hour_status[hour] = "ok"
 
-    return all_ticks, failed_hours
+    return all_ticks, failed_hours, hour_status
 
 
-def write_csv(ticks, path: str):
+def write_csv(ticks, path):
     """Write ticks to a CSV file."""
     with open(path, "w") as f:
         f.write("timestamp,ask,bid,ask_volume,bid_volume\n")
@@ -357,6 +363,95 @@ def write_csv(ticks, path: str):
                 f"{ts:%Y-%m-%d %H:%M:%S.%f},"
                 f"{ask},{bid},{ask_vol},{bid_vol}\n"
             )
+
+
+def _meta_path(csv_path: Path) -> Path:
+    """Return the .meta.json path for a given CSV path."""
+    return csv_path.with_suffix(".meta.json")
+
+
+def write_meta(csv_path: Path, symbol: str, day: datetime,
+               ticks: list, hour_status: dict):
+    """
+    Write a sidecar .meta.json alongside the CSV recording per-hour status.
+
+    hour_status: {hour_int -> "ok" | "empty" | "failed"}
+    """
+    import json
+
+    tick_by_hour = {}
+    for ts, *_ in ticks:
+        tick_by_hour[ts.hour] = tick_by_hour.get(ts.hour, 0) + 1
+
+    hours = {}
+    for h in range(24):
+        status = hour_status.get(h, "failed")
+        entry  = {"status": status}
+        if status == "ok":
+            entry["ticks"] = tick_by_hour.get(h, 0)
+        hours[f"{h:02d}"] = entry
+
+    meta = {
+        "symbol":        symbol,
+        "date":          day.strftime("%Y-%m-%d"),
+        "downloaded_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "hours":         hours,
+        "summary": {
+            "ok":     sum(1 for v in hours.values() if v["status"] == "ok"),
+            "empty":  sum(1 for v in hours.values() if v["status"] == "empty"),
+            "failed": sum(1 for v in hours.values() if v["status"] == "failed"),
+            "total_ticks": len(ticks),
+        },
+    }
+
+    with open(_meta_path(csv_path), "w") as f:
+        json.dump(meta, f, indent=2)
+
+
+def check_integrity(csv_path: Path) -> dict | None:
+    """
+    Read the sidecar .meta.json for a CSV and return a integrity report dict,
+    or None if no meta file exists.
+
+    Report keys: symbol, date, ok, empty, failed, total_ticks, failed_hours
+    """
+    import json
+
+    mp = _meta_path(csv_path)
+    if not mp.exists():
+        return None
+
+    with open(mp) as f:
+        meta = json.load(f)
+
+    failed_hours = [
+        int(h) for h, v in meta["hours"].items()
+        if v["status"] == "failed"
+    ]
+    return {
+        "symbol":       meta["symbol"],
+        "date":         meta["date"],
+        "ok":           meta["summary"]["ok"],
+        "empty":        meta["summary"]["empty"],
+        "failed":       meta["summary"]["failed"],
+        "total_ticks":  meta["summary"]["total_ticks"],
+        "failed_hours": failed_hours,
+    }
+
+
+def print_integrity(report: dict):
+    """Print a formatted integrity report for one day."""
+    ok_str     = f"{report['ok']:2d} hours with data"
+    empty_str  = f"{report['empty']:2d} hours empty (market closed)"
+    failed_str = f"{report['failed']:2d} hours MISSING"
+
+    status = "✓" if report["failed"] == 0 else "⚠"
+    print(f"  {status}  {report['date']}  ticks: {report['total_ticks']:>8,}")
+    print(f"       ✓  {ok_str}")
+    print(f"       ○  {empty_str}")
+    if report["failed"] > 0:
+        hrs = "  ".join(f"{h:02d}:00" for h in report["failed_hours"])
+        print(f"       ✗  {failed_str}  →  {hrs}")
 
 
 # ---------------------------------------------------------------------------
@@ -463,16 +558,24 @@ def _out_path(symbol: str, day: datetime) -> Path:
     return out_dir / filename
 
 
-def _save_day(symbol: str, day: datetime, ticks: list, failed_hours: list):
-    """Write one day's ticks and print a per-day summary line."""
+def _already_exists(symbol: str, day: datetime) -> bool:
+    """
+    Return True if a non-empty CSV already exists for this symbol/day.
+    Used to skip re-downloading files from interrupted runs.
+    """
+    p = _out_path(symbol, day)
+    return p.exists() and p.stat().st_size > 0
+
+
+def _save_day(symbol: str, day: datetime, ticks: list,
+              failed_hours: list, hour_status: dict):
+    """Write one day's CSV + meta, then print an integrity report."""
     filepath = _out_path(symbol, day)
     write_csv(ticks, filepath)
+    write_meta(filepath, symbol, day, ticks, hour_status)
 
-    tick_str  = f"{len(ticks):>7,} ticks"
-    fail_str  = f"  ⚠ {len(failed_hours)} hour(s) failed: " + \
-                ", ".join(f"{h:02d}:00" for h in failed_hours) \
-                if failed_hours else ""
-    print(f"  saved  {day:%Y-%m-%d}  {tick_str}  →  {filepath}{fail_str}")
+    report = check_integrity(filepath)
+    print_integrity(report)
 
 
 def main():
@@ -489,14 +592,21 @@ def main():
     # ── single day ────────────────────────────────────────────────────────
     if mode == "day":
         day = choose_date()
+
+        if _already_exists(symbol, day):
+            p = _out_path(symbol, day)
+            print(f"\n  Already exists: {p}")
+            print("  Delete the file first if you want to re-download.")
+            return
+
         print(f"\nDownloading {symbol}  {day:%Y-%m-%d} ...\n")
-        ticks, failed_hours = download_day(symbol, day)
+        ticks, failed_hours, hour_status = download_day(symbol, day)
 
         if not ticks and not failed_hours:
             print("\nNo ticks found. Check the date (weekend/holiday?) or symbol.")
             return
 
-        _save_day(symbol, day, ticks, failed_hours)
+        _save_day(symbol, day, ticks, failed_hours, hour_status)
 
         if ticks:
             print(f"\n  First tick : {ticks[0][0]:%Y-%m-%d %H:%M:%S.%f}")
@@ -519,12 +629,23 @@ def main():
         ]
 
         month_name = datetime(year, month, 1).strftime("%B %Y")
+
+        # pre-flight: check which days already exist
+        existing = [d for d in days if _already_exists(symbol, d)]
+        pending  = [d for d in days if not _already_exists(symbol, d)]
+
         print(f"\n  {month_name}  →  {n_days} days  "
               f"({days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d})")
-        print(f"  Symbol  : {symbol}")
-        print(f"  Workers : {MAX_WORKERS}")
-        print(f"  Output  : {Path(OUTPUT_DIR) / 'raw' / symbol / f'{year:04d}_{month:02d}'}/")
+        print(f"  Symbol   : {symbol}")
+        print(f"  Workers  : {MAX_WORKERS}")
+        print(f"  Output   : {Path(OUTPUT_DIR) / 'raw' / symbol / f'{year:04d}_{month:02d}'}/")
+        print(f"  To fetch : {len(pending)}  /  Already done : {len(existing)}")
         print()
+
+        if not pending:
+            print("  All days already downloaded. Nothing to do.")
+            return
+
         confirm = input("  Start download? [Y/n]: ").strip().lower()
         if confirm == "n":
             print("  Aborted.")
@@ -532,19 +653,19 @@ def main():
 
         print()
         total_ticks   = 0
-        total_failed  = []   # (day, [hours])
-        skipped_days  = []   # days with zero ticks and zero failures
+        total_failed  = []
+        skipped_days  = []
 
-        for i, day in enumerate(days, 1):
-            print(f"  [{i:2d}/{n_days}]  {day:%Y-%m-%d}")
-            ticks, failed_hours = download_day(symbol, day)
+        for i, day in enumerate(pending, 1):
+            print(f"  [{i:2d}/{len(pending)}]  {day:%Y-%m-%d}")
+            ticks, failed_hours, hour_status = download_day(symbol, day)
 
             if not ticks and not failed_hours:
                 skipped_days.append(day)
                 print(f"         no data (weekend / holiday)")
                 continue
 
-            _save_day(symbol, day, ticks, failed_hours)
+            _save_day(symbol, day, ticks, failed_hours, hour_status)
             total_ticks += len(ticks)
             if failed_hours:
                 total_failed.append((day, failed_hours))
@@ -554,22 +675,90 @@ def main():
         print("\n" + "=" * 55)
         print(f"  {month_name} download complete")
         print("=" * 55)
-        print(f"  Total ticks   : {total_ticks:,}")
-        print(f"  Days skipped  : {len(skipped_days)}  (no market data)")
+        print(f"  Total ticks     : {total_ticks:,}")
+        print(f"  Days downloaded : {len(pending) - len(skipped_days)}")
+        print(f"  Days skipped    : {len(skipped_days)}  (no market data)")
+        print(f"  Already existed : {len(existing)}")
 
         if total_failed:
-            print(f"  Days with gaps: {len(total_failed)}")
+            print(f"  Days with gaps  : {len(total_failed)}")
             for day, hours in total_failed:
                 hrs = ", ".join(f"{h:02d}:00" for h in hours)
                 print(f"    {day:%Y-%m-%d}  missing hours: {hrs}")
-            print("\n  Re-run those dates individually to fill gaps.")
+            print("\n  Re-run to retry gaps (existing complete days will be skipped).")
         else:
             print("  All days complete  ✓")
         print()
 
 
+def run_check(folder: str):
+    """
+    Scan a data folder for .meta.json files and print an integrity report.
+    Usage:  python dukascopy_downloader.py --check data/raw/XAUUSD/2025_09
+    """
+    import json
+
+    folder_path = Path(folder)
+    if not folder_path.exists():
+        print(f"  Folder not found: {folder_path}")
+        return
+
+    meta_files = sorted(folder_path.glob("*.meta.json"))
+    if not meta_files:
+        print(f"  No .meta.json files found in {folder_path}")
+        print("  Run a download first to generate them.")
+        return
+
+    print(f"\n  Integrity check: {folder_path}")
+    print("  " + "─" * 53)
+
+    total_ok = total_empty = total_failed = total_ticks = 0
+    days_with_gaps = []
+
+    for mp in meta_files:
+        # Strip .meta.json -> .csv  (mp.stem is e.g. "XAUUSD_ticks_2024-03-15.meta")
+        csv_path = mp.parent / (mp.stem.replace(".meta", "") + ".csv")
+        report   = check_integrity(csv_path)
+        if report is None:
+            continue
+        print_integrity(report)
+        total_ok     += report["ok"]
+        total_empty  += report["empty"]
+        total_failed += report["failed"]
+        total_ticks  += report["total_ticks"]
+        if report["failed"] > 0:
+            days_with_gaps.append(report["date"])
+
+    print("\n  " + "─" * 53)
+    print(f"  Days checked    : {len(meta_files)}")
+    print(f"  Total ticks     : {total_ticks:,}")
+    print(f"  Hours OK        : {total_ok}")
+    print(f"  Hours empty     : {total_empty}  (market closed, normal)")
+    print(f"  Hours missing   : {total_failed}")
+
+    if days_with_gaps:
+        print(f"\n  ⚠  {len(days_with_gaps)} day(s) have gaps:")
+        for d in days_with_gaps:
+            print(f"     {d}")
+        print("\n  Re-download those dates to fill gaps.")
+    else:
+        print("\n  All hours accounted for  ✓")
+    print()
+
+
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nAborted.")
+    import sys as _sys
+    if len(_sys.argv) > 1 and _sys.argv[1] == "--check":
+        if len(_sys.argv) < 3:
+            print("Usage: python dukascopy_downloader.py --check <folder>")
+            print("  e.g. python dukascopy_downloader.py --check data/raw/XAUUSD/2025_09")
+        else:
+            try:
+                run_check(_sys.argv[2])
+            except KeyboardInterrupt:
+                print("\n\nAborted.")
+    else:
+        try:
+            main()
+        except KeyboardInterrupt:
+            print("\n\nAborted.")
