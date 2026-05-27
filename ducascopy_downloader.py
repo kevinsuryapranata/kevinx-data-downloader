@@ -16,6 +16,7 @@ Dukascopy serves one LZMA-compressed (.bi5) file per hour. Each tick is a
 
 import io
 import lzma
+import os
 import struct
 import sys
 import threading
@@ -49,7 +50,7 @@ CONNECT_TIMEOUT = 15      # seconds to establish the connection
 READ_TIMEOUT    = 45      # seconds to wait for data once connected
 MAX_ATTEMPTS    = 6       # total tries per hour before giving up
 RETRY_BACKOFF   = 3       # base backoff seconds; grows each retry
-MAX_WORKERS     = 6       # parallel download threads (cap: 6)
+MAX_WORKERS     = max(1, int(os.cpu_count() * 0.7))  # 70% of available cores
 # --------------------------------------------------------------------------
 
 # A selection of commonly used Dukascopy instruments.
@@ -413,6 +414,7 @@ def choose_date() -> datetime:
 def main():
     print("\n" + "#" * 55)
     print("#  Dukascopy raw tick data downloader")
+    print(f"#  workers: {MAX_WORKERS}  ({os.cpu_count()} cores × 70%)")
     print("#" * 55)
 
     show_timeframes()
