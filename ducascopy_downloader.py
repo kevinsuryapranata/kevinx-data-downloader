@@ -57,31 +57,90 @@ MAX_WORKERS     = max(1, int(os.cpu_count() * 0.7))  # 70% of available cores
 
 # A selection of commonly used Dukascopy instruments.
 # 'point' is the divisor that turns the integer price into a real price.
+# 'type' drives the weekend/holiday skip logic (see dead_hours below).
 # This is not the full Dukascopy catalogue (which has thousands of symbols),
 # but covers the popular ones. Add more as you need them.
 INSTRUMENTS = {
-    # symbol        point     description
-    "XAUUSD":     (1000,    "Gold vs US Dollar"),
-    "XAGUSD":     (1000,    "Silver vs US Dollar"),
-    "EURUSD":     (100000,  "Euro vs US Dollar"),
-    "GBPUSD":     (100000,  "British Pound vs US Dollar"),
-    "USDJPY":     (1000,    "US Dollar vs Japanese Yen"),
-    "USDCHF":     (100000,  "US Dollar vs Swiss Franc"),
-    "AUDUSD":     (100000,  "Australian Dollar vs US Dollar"),
-    "USDCAD":     (100000,  "US Dollar vs Canadian Dollar"),
-    "NZDUSD":     (100000,  "New Zealand Dollar vs US Dollar"),
-    "EURGBP":     (100000,  "Euro vs British Pound"),
-    "EURJPY":     (1000,    "Euro vs Japanese Yen"),
-    "GBPJPY":     (1000,    "British Pound vs Japanese Yen"),
-    "BTCUSD":     (1000,    "Bitcoin vs US Dollar"),
-    "ETHUSD":     (1000,    "Ethereum vs US Dollar"),
-    "USA500IDXUSD": (1000,  "S&P 500 Index"),
-    "USATECHIDXUSD": (1000, "Nasdaq 100 Index"),
-    "DEUIDXEUR":  (1000,    "DAX 40 Index"),
-    "USDOLLARIDXUSD": (1000, "US Dollar Index"),
-    "LIGHTCMDUSD": (1000,   "WTI Crude Oil"),
-    "BRENTCMDUSD": (1000,   "Brent Crude Oil"),
+    # symbol            point     description                  type
+    "XAUUSD":     (1000,    "Gold vs US Dollar",         "metals"),
+    "XAGUSD":     (1000,    "Silver vs US Dollar",       "metals"),
+    "EURUSD":     (100000,  "Euro vs US Dollar",         "fx"),
+    "GBPUSD":     (100000,  "British Pound vs US Dollar","fx"),
+    "USDJPY":     (1000,    "US Dollar vs Japanese Yen", "fx"),
+    "USDCHF":     (100000,  "US Dollar vs Swiss Franc",  "fx"),
+    "AUDUSD":     (100000,  "Australian Dollar vs USD",  "fx"),
+    "USDCAD":     (100000,  "US Dollar vs Canadian Dollar","fx"),
+    "NZDUSD":     (100000,  "New Zealand Dollar vs USD", "fx"),
+    "EURGBP":     (100000,  "Euro vs British Pound",     "fx"),
+    "EURJPY":     (1000,    "Euro vs Japanese Yen",      "fx"),
+    "GBPJPY":     (1000,    "British Pound vs Japanese Yen","fx"),
+    "BTCUSD":     (1000,    "Bitcoin vs US Dollar",      "crypto"),
+    "ETHUSD":     (1000,    "Ethereum vs US Dollar",     "crypto"),
+    "USA500IDXUSD": (1000,  "S&P 500 Index",             "index_us"),
+    "USATECHIDXUSD": (1000, "Nasdaq 100 Index",          "index_us"),
+    "DEUIDXEUR":  (1000,    "DAX 40 Index",              "index_eu"),
+    "USDOLLARIDXUSD": (1000,"US Dollar Index",           "fx"),
+    "LIGHTCMDUSD": (1000,   "WTI Crude Oil",             "metals"),
+    "BRENTCMDUSD": (1000,   "Brent Crude Oil",           "metals"),
 }
+
+
+def dead_hours(symbol: str, day: datetime) -> set:
+    """
+    Return the set of hours (0-23 UTC) that are guaranteed to have no data
+    for this symbol on this day. These are skipped without hitting the network.
+
+    Philosophy: conservative. Only skip hours that are *always* dead.
+    When in doubt, let Dukascopy's 404 be the answer.
+
+    Schedule reference (all times UTC):
+      FX / metals / oil : Sun 22:00 open → Fri 22:00 close
+      US indices        : Mon-Fri 13:30-20:00 (core); wider pre/post ~11:00-21:00
+      EU indices        : Mon-Fri 07:00-21:00 roughly
+      Crypto            : 24/7, never skip
+    """
+    mtype   = INSTRUMENTS[symbol][2]
+    weekday = day.weekday()   # 0=Mon … 6=Sun
+
+    # ── crypto: never skip ───────────────────────────────────────────────────
+    if mtype == "crypto":
+        return set()
+
+    # ── Saturday: always dead for everything non-crypto ──────────────────────
+    if weekday == 5:   # Saturday
+        return set(range(24))
+
+    # ── FX / metals / oil ────────────────────────────────────────────────────
+    if mtype in ("fx", "metals"):
+        # Sunday: only 22:00-23:00 UTC is live; hours 00-21 are dead
+        if weekday == 6:
+            return set(range(0, 22))
+        # Friday: market closes at 22:00 UTC; hour 22-23 is dead
+        if weekday == 4:
+            return {22, 23}
+        # Mon-Thu: fully live
+        return set()
+
+    # ── US indices (S&P, Nasdaq) ──────────────────────────────────────────────
+    # Core session 13:30-20:00 UTC; pre-market from ~11:00; after ~21:00 dead.
+    # Be conservative: only skip the clearly-dead overnight hours.
+    if mtype == "index_us":
+        if weekday == 6:   # Sunday: dead all day
+            return set(range(24))
+        # Mon-Fri: skip 21:00-10:00 UTC (overnight dead zone, 13 hours)
+        dead = set(range(0, 10)) | {21, 22, 23}
+        return dead
+
+    # ── EU indices (DAX etc.) ─────────────────────────────────────────────────
+    # Roughly 07:00-21:00 UTC Mon-Fri.
+    if mtype == "index_eu":
+        if weekday == 6:
+            return set(range(24))
+        dead = set(range(0, 7)) | set(range(21, 24))
+        return dead
+
+    return set()   # unknown type: don't skip anything
+
 
 # Dukascopy only serves *tick* data through this feed. Bar timeframes
 # (1m, 5m, 1h, etc.) are not separate downloads -- you build them by
@@ -306,41 +365,53 @@ def download_day(symbol: str, day: datetime):
                 completed[0]        += 1
                 slots[slot]["state"] = "failed"
 
+    # ── pre-compute dead hours (guaranteed no data, skip network) ────────────
+    skip = dead_hours(symbol, day)
+    for hour in skip:
+        results[hour] = EMPTY_HOUR     # pre-fill so collect step sees them
+    live_hours = [h for h in range(total) if h not in skip]
+
+    if skip:
+        # adjust total so the board counts only live hours
+        total = len(live_hours)
+
     # ── run pool + display loop ──────────────────────────────────────────────
     first_draw = True
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-        for hour in range(total):
-            pool.submit(fetch_one, hour)
+    if live_hours:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            for hour in live_hours:
+                pool.submit(fetch_one, hour)
 
-        while completed[0] < total:
-            time.sleep(0.5)
-            with lock:
-                snap_slots = {k: dict(v) for k, v in slots.items()}
-                done       = completed[0]
-                ticks      = tick_count[0]
-            elapsed = time.monotonic() - start
-            board = _render_board(symbol, day, snap_slots,
-                                  done, total, ticks, elapsed, first_draw)
-            sys.stdout.write(board)
-            sys.stdout.flush()
-            first_draw = False
+            while completed[0] < total:
+                time.sleep(0.5)
+                with lock:
+                    snap_slots = {k: dict(v) for k, v in slots.items()}
+                    done       = completed[0]
+                    ticks      = tick_count[0]
+                elapsed = time.monotonic() - start
+                board = _render_board(symbol, day, snap_slots,
+                                      done, total, ticks, elapsed, first_draw)
+                sys.stdout.write(board)
+                sys.stdout.flush()
+                first_draw = False
 
     # ── final board draw ─────────────────────────────────────────────────────
-    with lock:
-        snap_slots = {k: dict(v) for k, v in slots.items()}
-        ticks      = tick_count[0]
-    elapsed = time.monotonic() - start
-    sys.stdout.write(
-        _render_board(symbol, day, snap_slots,
-                      total, total, ticks, elapsed, first_draw)
-    )
-    sys.stdout.flush()
+    if live_hours and total > 0:
+        with lock:
+            snap_slots = {k: dict(v) for k, v in slots.items()}
+            ticks      = tick_count[0]
+        elapsed = time.monotonic() - start
+        sys.stdout.write(
+            _render_board(symbol, day, snap_slots,
+                          total, total, ticks, elapsed, first_draw)
+        )
+        sys.stdout.flush()
 
-    # ── collect results in hour order ────────────────────────────────────────
+    # ── collect results in hour order (all 24 hours) ─────────────────────────
     # hour_status: hour -> "ok" | "empty" | "failed"
     all_ticks   = []
     hour_status = {}
-    for hour in range(total):
+    for hour in range(24):
         outcome = results.get(hour)
         if isinstance(outcome, Exception):
             failed_hours.append(hour)
