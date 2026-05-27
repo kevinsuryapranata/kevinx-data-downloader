@@ -1,0 +1,108 @@
+{
+  "symbol": "XAUUSD",
+  "date": "2026-02-09",
+  "downloaded_at": "2026-05-27T07:55:39Z",
+  "hours": {
+    "00": {
+      "status": "ok",
+      "ticks": 18474
+    },
+    "01": {
+      "status": "ok",
+      "ticks": 27786
+    },
+    "02": {
+      "status": "ok",
+      "ticks": 20196
+    },
+    "03": {
+      "status": "ok",
+      "ticks": 15886
+    },
+    "04": {
+      "status": "ok",
+      "ticks": 11760
+    },
+    "05": {
+      "status": "ok",
+      "ticks": 14296
+    },
+    "06": {
+      "status": "ok",
+      "ticks": 19375
+    },
+    "07": {
+      "status": "ok",
+      "ticks": 16347
+    },
+    "08": {
+      "status": "ok",
+      "ticks": 12032
+    },
+    "09": {
+      "status": "ok",
+      "ticks": 10752
+    },
+    "10": {
+      "status": "ok",
+      "ticks": 14169
+    },
+    "11": {
+      "status": "ok",
+      "ticks": 9301
+    },
+    "12": {
+      "status": "ok",
+      "ticks": 9129
+    },
+    "13": {
+      "status": "ok",
+      "ticks": 19972
+    },
+    "14": {
+      "status": "ok",
+      "ticks": 23516
+    },
+    "15": {
+      "status": "ok",
+      "ticks": 20454
+    },
+    "16": {
+      "status": "ok",
+      "ticks": 17091
+    },
+    "17": {
+      "status": "ok",
+      "ticks": 13684
+    },
+    "18": {
+      "status": "ok",
+      "ticks": 14783
+    },
+    "19": {
+      "status": "ok",
+      "ticks": 10345
+    },
+    "20": {
+      "status": "ok",
+      "ticks": 15484
+    },
+    "21": {
+      "status": "ok",
+      "ticks": 6583
+    },
+    "22": {
+      "status": "empty"
+    },
+    "23": {
+      "status": "ok",
+      "ticks": 19691
+    }
+  },
+  "summary": {
+    "ok": 23,
+    "empty": 1,
+    "failed": 0,
+    "total_ticks": 361106
+  }
+}
