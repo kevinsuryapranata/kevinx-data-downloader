@@ -117,11 +117,12 @@ def add_indicators(h1: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 class Trade:
-    __slots__ = ("entry_time", "direction", "entry_price",
+    __slots__ = ("entry_time", "entry_bar", "direction", "entry_price",
                  "sl", "tp", "exit_time", "exit_price", "exit_reason", "pnl")
 
-    def __init__(self, entry_time, direction, entry_price, sl, tp):
+    def __init__(self, entry_time, entry_bar, direction, entry_price, sl, tp):
         self.entry_time  = entry_time
+        self.entry_bar   = entry_bar   # bar index — skip SL/TP check on this bar
         self.direction   = direction   # +1 long, -1 short
         self.entry_price = entry_price
         self.sl          = sl
@@ -150,7 +151,7 @@ def run_backtest(h1: pd.DataFrame) -> list[Trade]:
         bar = bars.iloc[i]
 
         # ── check if active trade is stopped out or hits TP this bar ───────
-        if active is not None:
+        if active is not None and i > active.entry_bar:
             hi = bar["high"]
             lo = bar["low"]
             op = bar["open"]
@@ -205,7 +206,7 @@ def run_backtest(h1: pd.DataFrame) -> list[Trade]:
                 sl    = entry + SL_PIPS * PIP_SIZE
                 tp    = entry - TP_PIPS * PIP_SIZE
 
-            active = Trade(bar["timestamp"], direction, entry, sl, tp)
+            active = Trade(bar["timestamp"], i, direction, entry, sl, tp)
 
     # close any open trade at last bar
     if active is not None:
