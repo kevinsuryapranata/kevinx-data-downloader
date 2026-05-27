@@ -109,15 +109,16 @@ def hour_url(symbol: str, dt: datetime) -> str:
     )
 
 
-def fetch_hour(symbol: str, dt: datetime, on_retry=None):
+def fetch_hour(symbol: str, dt: datetime, on_retry=None, on_download=None):
     """
     Download and decode one hour of ticks.
 
     Returns a list of (timestamp, ask, bid, ask_vol, bid_vol) tuples.
     An empty list means no ticks for that hour (weekend, holiday, etc.).
 
-    on_retry: optional callable(attempt, max_attempts) invoked before each
-    retry, so callers can show retry activity in a progress display.
+    on_retry:    optional callable(attempt, max_attempts) -- called before each retry.
+    on_download: optional callable() -- called once the response is received and
+                 we're about to decompress, so callers can update "downloading" state.
     """
     url = hour_url(symbol, dt)
     point = INSTRUMENTS[symbol][0]
@@ -142,6 +143,9 @@ def fetch_hour(symbol: str, dt: datetime, on_retry=None):
         return []           # no data this hour -- normal for closed markets
     resp.raise_for_status()
 
+    if on_download:
+        on_download()
+
     raw = resp.content
     if not raw:
         return []
@@ -161,26 +165,82 @@ def fetch_hour(symbol: str, dt: datetime, on_retry=None):
 
 
 def _fmt_elapsed(seconds: float) -> str:
-    """Format a duration as MM:SS (or HH:MM:SS if long)."""
+    """Format a duration as MM:SS (or HH:MM:SS if over an hour)."""
     seconds = int(seconds)
     h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
+    m, s   = divmod(rem, 60)
     if h:
         return f"{h:d}:{m:02d}:{s:02d}"
     return f"{m:02d}:{s:02d}"
 
 
-def _progress_line(done: int, total: int, ticks: int,
-                   elapsed: float, status: str) -> str:
-    """Build a single-line progress display."""
-    width = 24
-    filled = int(width * done / total)
-    bar = "#" * filled + "-" * (width - filled)
+BOARD_LINES = MAX_WORKERS + 2   # header + separator + one line per slot
+
+
+def _render_board(symbol: str, day: datetime, slots: dict,
+                  done: int, total: int, ticks: int,
+                  elapsed: float, first_draw: bool) -> str:
+    """
+    Build the full worker-board string.
+
+    slots: dict of  slot_index -> {hour, state, detail, since}
+      state: 'idle' | 'connecting' | 'downloading' | 'retrying' | 'done' | 'failed'
+    """
+    ICON = {
+        "idle":        "  ",
+        "connecting":  "↓ ",
+        "downloading": "↓ ",
+        "retrying":    "⟳ ",
+        "done":        "✓ ",
+        "failed":      "✗ ",
+    }
+
+    lines = []
+
+    # ── header ──────────────────────────────────────────────────────────────
     pct = 100 * done / total
-    return (
-        f"\r  [{bar}] {done:2d}/{total} ({pct:3.0f}%)  "
-        f"ticks={ticks:<7d}  elapsed={_fmt_elapsed(elapsed)}  {status}   "
+    lines.append(
+        f"  {symbol}  {day:%Y-%m-%d}  "
+        f"elapsed: {_fmt_elapsed(elapsed)}   "
+        f"done: {done}/{total} ({pct:.0f}%)   "
+        f"ticks: {ticks:,}"
     )
+    lines.append("  " + "─" * 54)
+
+    # ── one line per worker slot ─────────────────────────────────────────────
+    for i in range(MAX_WORKERS):
+        s = slots.get(i)
+        if s is None:
+            lines.append(f"  slot {i+1}  –  idle")
+            continue
+
+        icon  = ICON.get(s["state"], "  ")
+        state = s["state"]
+
+        if state == "done":
+            tc = s.get("ticks", 0)
+            lines.append(
+                f"  slot {i+1}  {icon} {s['hour']:02d}:00  "
+                f"{tc:>6,} ticks"
+            )
+        elif state == "failed":
+            lines.append(
+                f"  slot {i+1}  {icon} {s['hour']:02d}:00  FAILED"
+            )
+        elif state == "retrying":
+            waited = int(time.monotonic() - s["since"])
+            lines.append(
+                f"  slot {i+1}  {icon} {s['hour']:02d}:00  "
+                f"{s['detail']}  ({waited}s)"
+            )
+        else:
+            lines.append(
+                f"  slot {i+1}  {icon} {s['hour']:02d}:00  {state}..."
+            )
+
+    # Move cursor up to overwrite previous board (after first draw).
+    move_up = "" if first_draw else f"\033[{len(lines)}A"
+    return move_up + "\n".join(lines) + "\n"
 
 
 def download_day(symbol: str, day: datetime):
@@ -188,89 +248,100 @@ def download_day(symbol: str, day: datetime):
     Download all 24 hours for a given calendar day (UTC) using a thread pool.
 
     Up to MAX_WORKERS hours are fetched in parallel. The main thread drives
-    a live progress line showing active slots, completed count, tick count,
-    and elapsed time -- updated every second.
+    a fixed worker-board display: one line per slot showing state, hour,
+    retry count, retry timer, and tick count. Redraws in place every second.
     """
-    total      = 24
-    start      = time.monotonic()
-    lock       = threading.Lock()
+    total    = 24
+    start    = time.monotonic()
+    lock     = threading.Lock()
 
-    # Shared state written by workers, read by the display loop.
-    completed  = [0]           # hours finished (success or fail)
-    tick_count = [0]           # ticks collected so far
+    # ── shared state ────────────────────────────────────────────────────────
+    completed  = [0]
+    tick_count = [0]
     failed_hours = []
-    results    = {}            # hour -> list-of-ticks (ordered later)
-    active     = {}            # hour -> status string (what it's doing now)
+    results    = {}            # hour -> ticks list or Exception
+
+    # slots: slot_index -> state dict
+    # hour_to_slot: hour -> slot_index (assigned when worker starts)
+    slots        = {}
+    hour_to_slot = {}
+    next_slot    = [0]         # simple round-robin slot assignment
 
     def fetch_one(hour: int):
         dt = day.replace(hour=hour, minute=0, second=0, microsecond=0)
 
+        with lock:
+            slot = next_slot[0] % MAX_WORKERS
+            next_slot[0] += 1
+            hour_to_slot[hour] = slot
+            slots[slot] = {"hour": hour, "state": "connecting",
+                           "detail": "", "since": time.monotonic(), "ticks": 0}
+
         def on_retry(attempt, max_attempts):
             with lock:
-                active[hour] = f"{hour:02d}:00 retry {attempt}/{max_attempts-1}"
+                slots[slot]["state"]  = "retrying"
+                slots[slot]["detail"] = f"retry {attempt}/{max_attempts-1}"
+                slots[slot]["since"]  = time.monotonic()
 
-        with lock:
-            active[hour] = f"{hour:02d}:00 connecting..."
+        def on_download():
+            with lock:
+                slots[slot]["state"] = "downloading"
+                slots[slot]["since"] = time.monotonic()
 
         try:
-            ticks = fetch_hour(symbol, dt, on_retry=on_retry)
+            ticks = fetch_hour(symbol, dt, on_retry=on_retry,
+                               on_download=on_download)
             with lock:
-                results[hour] = ticks
-                tick_count[0] += len(ticks)
-                completed[0]  += 1
-                active.pop(hour, None)
-        except Exception as exc:                   # noqa: BLE001
+                results[hour]       = ticks
+                tick_count[0]      += len(ticks)
+                completed[0]       += 1
+                slots[slot]["state"] = "done"
+                slots[slot]["ticks"] = len(ticks)
+        except Exception as exc:                        # noqa: BLE001
             with lock:
-                results[hour] = exc
-                completed[0] += 1
-                active.pop(hour, None)
+                results[hour]        = exc
+                completed[0]        += 1
+                slots[slot]["state"] = "failed"
 
-    # Submit all 24 hours; the pool caps concurrency at MAX_WORKERS.
-    futures = {}
+    # ── run pool + display loop ──────────────────────────────────────────────
+    first_draw = True
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         for hour in range(total):
-            futures[pool.submit(fetch_one, hour)] = hour
+            pool.submit(fetch_one, hour)
 
-        # Drive the progress display while workers run.
         while completed[0] < total:
             time.sleep(0.5)
-            elapsed = time.monotonic() - start
             with lock:
-                done   = completed[0]
-                ticks  = tick_count[0]
-                slots  = sorted(active.values())
-
-            # Show up to 3 active slots so the line stays one-liner width.
-            if slots:
-                slot_str = "  [" + "  |  ".join(slots[:3])
-                if len(slots) > 3:
-                    slot_str += f"  +{len(slots)-3} more"
-                slot_str += "]"
-            else:
-                slot_str = "  [waiting...]"
-
-            sys.stdout.write(
-                _progress_line(done, total, ticks, elapsed, slot_str)
-            )
+                snap_slots = {k: dict(v) for k, v in slots.items()}
+                done       = completed[0]
+                ticks      = tick_count[0]
+            elapsed = time.monotonic() - start
+            board = _render_board(symbol, day, snap_slots,
+                                  done, total, ticks, elapsed, first_draw)
+            sys.stdout.write(board)
             sys.stdout.flush()
+            first_draw = False
 
-    # All futures done -- collect errors and sort ticks by hour.
+    # ── final board draw ─────────────────────────────────────────────────────
+    with lock:
+        snap_slots = {k: dict(v) for k, v in slots.items()}
+        ticks      = tick_count[0]
+    elapsed = time.monotonic() - start
+    sys.stdout.write(
+        _render_board(symbol, day, snap_slots,
+                      total, total, ticks, elapsed, first_draw)
+    )
+    sys.stdout.flush()
+
+    # ── collect results in hour order ────────────────────────────────────────
     all_ticks = []
     for hour in range(total):
         outcome = results.get(hour, [])
         if isinstance(outcome, Exception):
-            sys.stdout.write("\r" + " " * 120 + "\r")
-            print(f"  ! hour {hour:02d} failed: {outcome}")
             failed_hours.append(hour)
         else:
             all_ticks.extend(outcome)
 
-    elapsed = time.monotonic() - start
-    sys.stdout.write(
-        _progress_line(total, total, len(all_ticks), elapsed, "  [complete]")
-    )
-    sys.stdout.write("\n")
-    sys.stdout.flush()
     return all_ticks, failed_hours
 
 
