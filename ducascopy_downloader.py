@@ -20,6 +20,7 @@ import struct
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -48,6 +49,7 @@ CONNECT_TIMEOUT = 15      # seconds to establish the connection
 READ_TIMEOUT    = 45      # seconds to wait for data once connected
 MAX_ATTEMPTS    = 6       # total tries per hour before giving up
 RETRY_BACKOFF   = 3       # base backoff seconds; grows each retry
+MAX_WORKERS     = 6       # parallel download threads (cap: 6)
 # --------------------------------------------------------------------------
 
 # A selection of commonly used Dukascopy instruments.
@@ -183,78 +185,89 @@ def _progress_line(done: int, total: int, ticks: int,
 
 def download_day(symbol: str, day: datetime):
     """
-    Download all 24 hours for a given calendar day (UTC).
+    Download all 24 hours for a given calendar day (UTC) using a thread pool.
 
-    Each hour is fetched in a background thread so the main thread can keep
-    refreshing the progress line -- including a heartbeat at least every
-    10 seconds -- even if a single request is slow or hangs.
+    Up to MAX_WORKERS hours are fetched in parallel. The main thread drives
+    a live progress line showing active slots, completed count, tick count,
+    and elapsed time -- updated every second.
     """
-    all_ticks = []
-    total = 24
-    start = time.monotonic()
-    failed_hours = []     # hours that errored out after all retries
+    total      = 24
+    start      = time.monotonic()
+    lock       = threading.Lock()
 
-    for hour in range(total):
+    # Shared state written by workers, read by the display loop.
+    completed  = [0]           # hours finished (success or fail)
+    tick_count = [0]           # ticks collected so far
+    failed_hours = []
+    results    = {}            # hour -> list-of-ticks (ordered later)
+    active     = {}            # hour -> status string (what it's doing now)
+
+    def fetch_one(hour: int):
         dt = day.replace(hour=hour, minute=0, second=0, microsecond=0)
 
-        # Run the network fetch in a worker thread. result[0] holds the
-        # outcome: a list of ticks, or an Exception. retry_note[0] is
-        # updated live by the on_retry callback so the progress line can
-        # show when an hour is being retried.
-        result = [None]
-        retry_note = [""]
-
         def on_retry(attempt, max_attempts):
-            retry_note[0] = f" retry {attempt}/{max_attempts - 1}"
+            with lock:
+                active[hour] = f"{hour:02d}:00 retry {attempt}/{max_attempts-1}"
 
-        def worker():
-            try:
-                result[0] = fetch_hour(symbol, dt, on_retry=on_retry)
-            except Exception as exc:          # noqa: BLE001
-                result[0] = exc
+        with lock:
+            active[hour] = f"{hour:02d}:00 connecting..."
 
-        thread = threading.Thread(target=worker, daemon=True)
-        thread.start()
+        try:
+            ticks = fetch_hour(symbol, dt, on_retry=on_retry)
+            with lock:
+                results[hour] = ticks
+                tick_count[0] += len(ticks)
+                completed[0]  += 1
+                active.pop(hour, None)
+        except Exception as exc:                   # noqa: BLE001
+            with lock:
+                results[hour] = exc
+                completed[0] += 1
+                active.pop(hour, None)
 
-        # Wait for the worker, refreshing the display while it runs.
-        last_heartbeat = time.monotonic()
-        while thread.is_alive():
-            thread.join(timeout=1.0)
-            now = time.monotonic()
-            elapsed = now - start
-            # Normal refresh every second; explicit heartbeat note every 10s
-            # so a long-running hour is obviously still alive, not frozen.
-            waited = now - last_heartbeat
-            if waited >= 10:
-                status = f"working {hour:02d}:00 (still waiting...)"
-                last_heartbeat = now
+    # Submit all 24 hours; the pool caps concurrency at MAX_WORKERS.
+    futures = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        for hour in range(total):
+            futures[pool.submit(fetch_one, hour)] = hour
+
+        # Drive the progress display while workers run.
+        while completed[0] < total:
+            time.sleep(0.5)
+            elapsed = time.monotonic() - start
+            with lock:
+                done   = completed[0]
+                ticks  = tick_count[0]
+                slots  = sorted(active.values())
+
+            # Show up to 3 active slots so the line stays one-liner width.
+            if slots:
+                slot_str = "  [" + "  |  ".join(slots[:3])
+                if len(slots) > 3:
+                    slot_str += f"  +{len(slots)-3} more"
+                slot_str += "]"
             else:
-                status = f"working {hour:02d}:00{retry_note[0]}..."
+                slot_str = "  [waiting...]"
+
             sys.stdout.write(
-                _progress_line(hour, total, len(all_ticks), elapsed, status)
+                _progress_line(done, total, ticks, elapsed, slot_str)
             )
             sys.stdout.flush()
 
-        # Worker finished -- collect its result.
-        outcome = result[0]
+    # All futures done -- collect errors and sort ticks by hour.
+    all_ticks = []
+    for hour in range(total):
+        outcome = results.get(hour, [])
         if isinstance(outcome, Exception):
-            sys.stdout.write("\r" + " " * 100 + "\r")
-            print(f"  ! error on hour {hour:02d}: {outcome}")
+            sys.stdout.write("\r" + " " * 120 + "\r")
+            print(f"  ! hour {hour:02d} failed: {outcome}")
             failed_hours.append(hour)
-            outcome = []
-        all_ticks.extend(outcome)
-
-        # Refresh the line now that this hour is done.
-        elapsed = time.monotonic() - start
-        sys.stdout.write(
-            _progress_line(hour + 1, total, len(all_ticks),
-                           elapsed, f"hour {hour:02d}:00 done")
-        )
-        sys.stdout.flush()
+        else:
+            all_ticks.extend(outcome)
 
     elapsed = time.monotonic() - start
     sys.stdout.write(
-        _progress_line(total, total, len(all_ticks), elapsed, "complete")
+        _progress_line(total, total, len(all_ticks), elapsed, "  [complete]")
     )
     sys.stdout.write("\n")
     sys.stdout.flush()
