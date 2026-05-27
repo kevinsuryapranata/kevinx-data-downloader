@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import requests
 
@@ -30,9 +31,24 @@ import requests
 
 BASE_URL = "https://datafeed.dukascopy.com/datafeed"
 
+# Output directory -- created automatically if it doesn't exist.
+# Change this to any absolute or relative path you prefer.
+OUTPUT_DIR = "data"
+
 # Output filename template. Iterate on this as needed.
 # Available fields: {symbol} {date} {start} {end}
 FILENAME_TEMPLATE = "{symbol}_ticks_{date}.csv"
+
+# --- Network tuning -------------------------------------------------------
+# If you're on a VPN or a slow connection, raise these. Read timeouts mean
+# the connection works but data arrives too slowly -- bigger timeouts and
+# more retries usually fix it. If downloads are reliably fast, you can
+# lower them so genuine failures are detected sooner.
+CONNECT_TIMEOUT = 15      # seconds to establish the connection
+READ_TIMEOUT    = 45      # seconds to wait for data once connected
+MAX_ATTEMPTS    = 6       # total tries per hour before giving up
+RETRY_BACKOFF   = 3       # base backoff seconds; grows each retry
+# --------------------------------------------------------------------------
 
 # A selection of commonly used Dukascopy instruments.
 # 'point' is the divisor that turns the integer price into a real price.
@@ -91,17 +107,35 @@ def hour_url(symbol: str, dt: datetime) -> str:
     )
 
 
-def fetch_hour(symbol: str, dt: datetime):
+def fetch_hour(symbol: str, dt: datetime, on_retry=None):
     """
     Download and decode one hour of ticks.
 
     Returns a list of (timestamp, ask, bid, ask_vol, bid_vol) tuples.
     An empty list means no ticks for that hour (weekend, holiday, etc.).
+
+    on_retry: optional callable(attempt, max_attempts) invoked before each
+    retry, so callers can show retry activity in a progress display.
     """
     url = hour_url(symbol, dt)
     point = INSTRUMENTS[symbol][0]
 
-    resp = requests.get(url, timeout=(10, 20))   # (connect, read) timeouts
+    # Retry the request a few times with growing backoff. Dukascopy
+    # occasionally responds slowly to rapid sequential requests, causing
+    # read timeouts -- a retry usually succeeds where the first try failed.
+    # VPNs make this worse; tune the constants at the top of the file.
+    resp = None
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            resp = requests.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            break
+        except requests.RequestException:
+            if attempt == MAX_ATTEMPTS:
+                raise                       # give up -- caller logs it
+            if on_retry:
+                on_retry(attempt, MAX_ATTEMPTS)
+            time.sleep(RETRY_BACKOFF * attempt)
+
     if resp.status_code == 404:
         return []           # no data this hour -- normal for closed markets
     resp.raise_for_status()
@@ -158,17 +192,24 @@ def download_day(symbol: str, day: datetime):
     all_ticks = []
     total = 24
     start = time.monotonic()
+    failed_hours = []     # hours that errored out after all retries
 
     for hour in range(total):
         dt = day.replace(hour=hour, minute=0, second=0, microsecond=0)
 
         # Run the network fetch in a worker thread. result[0] holds the
-        # outcome: a list of ticks, or an Exception.
+        # outcome: a list of ticks, or an Exception. retry_note[0] is
+        # updated live by the on_retry callback so the progress line can
+        # show when an hour is being retried.
         result = [None]
+        retry_note = [""]
+
+        def on_retry(attempt, max_attempts):
+            retry_note[0] = f" retry {attempt}/{max_attempts - 1}"
 
         def worker():
             try:
-                result[0] = fetch_hour(symbol, dt)
+                result[0] = fetch_hour(symbol, dt, on_retry=on_retry)
             except Exception as exc:          # noqa: BLE001
                 result[0] = exc
 
@@ -188,7 +229,7 @@ def download_day(symbol: str, day: datetime):
                 status = f"working {hour:02d}:00 (still waiting...)"
                 last_heartbeat = now
             else:
-                status = f"working {hour:02d}:00..."
+                status = f"working {hour:02d}:00{retry_note[0]}..."
             sys.stdout.write(
                 _progress_line(hour, total, len(all_ticks), elapsed, status)
             )
@@ -199,6 +240,7 @@ def download_day(symbol: str, day: datetime):
         if isinstance(outcome, Exception):
             sys.stdout.write("\r" + " " * 100 + "\r")
             print(f"  ! error on hour {hour:02d}: {outcome}")
+            failed_hours.append(hour)
             outcome = []
         all_ticks.extend(outcome)
 
@@ -216,7 +258,7 @@ def download_day(symbol: str, day: datetime):
     )
     sys.stdout.write("\n")
     sys.stdout.flush()
-    return all_ticks
+    return all_ticks, failed_hours
 
 
 def write_csv(ticks, path: str):
@@ -295,9 +337,9 @@ def main():
     day = choose_date()
 
     print(f"\nDownloading tick data for {symbol} on {day:%Y-%m-%d} ...")
-    ticks = download_day(symbol, day)
+    ticks, failed_hours = download_day(symbol, day)
 
-    if not ticks:
+    if not ticks and not failed_hours:
         print("\nNo ticks found. Check the date (weekend/holiday?) or symbol.")
         return
 
@@ -307,10 +349,28 @@ def main():
         start=day.strftime("%Y%m%d"),
         end=day.strftime("%Y%m%d"),
     )
-    write_csv(ticks, filename)
-    print(f"\nSaved {len(ticks)} ticks to: {filename}")
-    print(f"First tick: {ticks[0][0]:%Y-%m-%d %H:%M:%S.%f}")
-    print(f"Last  tick: {ticks[-1][0]:%Y-%m-%d %H:%M:%S.%f}\n")
+    out_dir = Path(OUTPUT_DIR)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    filepath = out_dir / filename
+    write_csv(ticks, filepath)
+    print(f"\nSaved {len(ticks)} ticks to: {filepath}")
+    if ticks:
+        print(f"First tick: {ticks[0][0]:%Y-%m-%d %H:%M:%S.%f}")
+        print(f"Last  tick: {ticks[-1][0]:%Y-%m-%d %H:%M:%S.%f}")
+
+    # Tell the user exactly which hours failed (vs. were just empty), so
+    # they know whether to re-run. A failed hour means a download error;
+    # an empty hour with no failures means the market was simply closed.
+    if failed_hours:
+        hrs = ", ".join(f"{h:02d}:00" for h in failed_hours)
+        print(f"\n  WARNING: {len(failed_hours)} hour(s) failed to download: {hrs}")
+        print("  These are NOT in the file. The data is incomplete.")
+        print("  Re-run for the same date to retry, or raise the timeout")
+        print("  values at the top of the script (CONNECT/READ_TIMEOUT).")
+        print("  If you are on a VPN, try turning it off for the download.")
+    else:
+        print("\n  All 24 hours downloaded successfully.")
+    print()
 
 
 if __name__ == "__main__":
