@@ -330,19 +330,13 @@ class HourQueue:
 
 class LiveDisplay:
     """
-    Draws a live in-place status board:
+    Draws a live in-place status board. Bars shown depend on mode:
 
-        ╔══════════════════════════════════════════════════════════╗
-        ║  EURUSD  2024-03  elapsed: 01:23   ▓▓▓▓▓░░░░ 52%        ║
-        ║  Days  [███████████████░░░░░░░░░░░░]  14/31              ║
-        ║  Hours [████░░░░░░░░░░░░░░░░░░░░░░]  320/744             ║
-        ╠══════════════════════════════════════════════════════════╣
-        ║  worker 1  ↓  2024-03-15 14:00  attempt 1               ║
-        ║  worker 2  ⟳  2024-03-15 07:00  attempt 2  (retry 8s)   ║
-        ╚══════════════════════════════════════════════════════════╝
+      Year mode  : Months / Days / Hours  (all epoch-style, reset per level)
+      Month mode : Days / Hours
+      Day mode   : Hours only
 
-    All drawing goes through write() so the caller can redirect to a buffer
-    for testing. The board is redrawn in-place using ANSI cursor-up escapes.
+    The board is redrawn in-place using ANSI cursor-up escapes.
     """
 
     ICON = {
@@ -357,67 +351,76 @@ class LiveDisplay:
 
     def __init__(self, symbol: str, n_workers: int,
                  total_days: int, total_hours: int,
-                 label: str = ""):
-        self.symbol      = symbol
-        self.n_workers   = n_workers
-        self.total_days  = total_days
-        self.total_hours = total_hours
-        self.label       = label          # e.g. "2024-03" or "2024-03-15"
+                 label: str = "",
+                 total_months: int = 0):
+        self.symbol        = symbol
+        self.n_workers     = n_workers
+        self.total_days    = total_days
+        self.total_hours   = total_hours
+        self.total_months  = total_months  # >0 only in year mode
+        self.label         = label
 
-        # n_header lines + separator + n_worker lines + bottom border
-        self._n_lines    = 5 + n_workers
-        self._first      = True
-        self._lock       = threading.Lock()
-
-    # ── public setters (called by workers) ──────────────────────────────────
+        self._n_lines = 5 + n_workers
+        self._first   = True
+        self._lock    = threading.Lock()
 
     def draw(self, slots: dict,
              done_hours: int, done_days: int,
-             total_ticks: int, elapsed: float):
+             total_ticks: int, elapsed: float,
+             done_months: int = 0):
         """Render and print the board, overwriting the previous frame."""
-        lines = self._build(slots, done_hours, done_days, total_ticks, elapsed)
+        lines = self._build(slots, done_hours, done_days,
+                            total_ticks, elapsed, done_months)
         with self._lock:
             if not self._first:
-                # move cursor up N lines
                 sys.stdout.write(f"\033[{self._n_lines}A")
             sys.stdout.write("\n".join(lines) + "\n")
             sys.stdout.flush()
             self._first = False
 
-    # ── internals ───────────────────────────────────────────────────────────
-
     def _build(self, slots: dict,
                done_hours: int, done_days: int,
-               total_ticks: int, elapsed: float) -> list[str]:
+               total_ticks: int, elapsed: float,
+               done_months: int = 0) -> list[str]:
 
-        W = 62   # inner content width (between the border chars)
+        W = 62
 
         def box(text: str) -> str:
             return f"  {text:<{W}}"
 
         lines = []
 
-        # ── title bar ───────────────────────────────────────────────────────
+        # ── title ────────────────────────────────────────────────────────────
         title = (f"{self.symbol}  {self.label}"
                  f"  elapsed: {_fmt_elapsed(elapsed)}"
                  f"  ticks: {total_ticks:,}")
         lines.append(box(title))
         lines.append("  " + "─" * W)
 
-        # ── days bar (only shown for multi-day runs) ─────────────────────────
-        if self.total_days > 1:
-            days_bar = _bar(done_days, self.total_days, width=24)
-            lines.append(box(f"  Days   {days_bar}  {done_days}/{self.total_days}"))
+        # ── months bar (year mode only) ───────────────────────────────────────
+        if self.total_months > 0:
+            mb = _bar(done_months, self.total_months, width=24)
+            lines.append(box(f"  Months {mb}  {done_months}/{self.total_months}"))
 
-        # ── hours bar ───────────────────────────────────────────────────────
-        hours_bar = _bar(done_hours, self.total_hours, width=24)
-        lines.append(box(f"  Hours  {hours_bar}  {done_hours}/{self.total_hours}"))
+        # ── days bar (multi-day runs) ─────────────────────────────────────────
+        if self.total_days > 1:
+            db = _bar(done_days, self.total_days, width=24)
+            lines.append(box(f"  Days   {db}  {done_days}/{self.total_days}"))
+
+        # ── hours bar ────────────────────────────────────────────────────────
+        hb = _bar(done_hours, self.total_hours, width=24)
+        lines.append(box(f"  Hours  {hb}  {done_hours}/{self.total_hours}"))
         lines.append("  " + "─" * W)
 
-        # update line count dynamically (multi-day vs single-day)
-        self._n_lines = (5 if self.total_days > 1 else 4) + self.n_workers
+        # recompute line count based on which bars are visible
+        n_bars = 1  # hours always shown
+        if self.total_days > 1:
+            n_bars += 1
+        if self.total_months > 0:
+            n_bars += 1
+        self._n_lines = 2 + n_bars + 1 + self.n_workers  # title+sep + bars + sep + workers
 
-        # ── one line per worker ──────────────────────────────────────────────
+        # ── one line per worker ───────────────────────────────────────────────
         for i in range(self.n_workers):
             s = slots.get(i)
             if s is None or s["state"] == "idle":
@@ -486,7 +489,9 @@ def _seed_queue(queue: HourQueue, symbol: str,
 
 
 def download_queued(symbol: str, days: list[datetime],
-                    label: str = "") -> tuple[list, list, dict]:
+                    label: str = "",
+                    total_months: int = 0,
+                    done_months: int = 0) -> tuple[list, list, dict]:
     """
     Download all (day, hour) pairs in *days* using a shared priority queue.
 
@@ -494,13 +499,16 @@ def download_queued(symbol: str, days: list[datetime],
     Failed hours are requeued in sorted order with an incremented attempt
     counter; once attempt >= MAX_RETRIES the hour is abandoned.
 
+    total_months / done_months: passed in by year mode to show the months bar.
+
     Returns:
       all_ticks    : list of tick tuples, in chronological order
       failed_hours : list of (day, hour) pairs that were abandoned
       hour_status  : dict of {(day, hour) -> "ok" | "empty" | "failed"}
     """
-    start = time.monotonic()
-    lock  = threading.Lock()
+    start        = time.monotonic()
+    lock         = threading.Lock()
+    done_months  = done_months   # shadow param so display loop can read it
 
     # ── shared accumulators ──────────────────────────────────────────────────
     results      = {}          # (day, hour) -> list | EMPTY_HOUR | Exception
@@ -531,11 +539,12 @@ def download_queued(symbol: str, days: list[datetime],
             label = f"{days[0]:%Y-%m-%d} → {days[-1]:%Y-%m-%d}"
 
     display = LiveDisplay(
-        symbol      = symbol,
-        n_workers   = MAX_WORKERS,
-        total_days  = n_days_q,
-        total_hours = n_hours_q,
-        label       = label,
+        symbol        = symbol,
+        n_workers     = MAX_WORKERS,
+        total_days    = n_days_q,
+        total_hours   = n_hours_q,
+        label         = label,
+        total_months  = total_months,
     )
 
     # ── worker function ──────────────────────────────────────────────────────
@@ -663,7 +672,8 @@ def download_queued(symbol: str, days: list[datetime],
                 dd     = done_days[0]
                 ticks  = tick_count[0]
             elapsed = time.monotonic() - start
-            display.draw(snap, dh, dd, ticks, elapsed)
+            display.draw(snap, dh, dd, ticks, elapsed,
+                         done_months=done_months)
 
             # check if all workers finished
             if all(f.done() for f in futures):
@@ -675,7 +685,8 @@ def download_queued(symbol: str, days: list[datetime],
         snap  = {k: dict(v) for k, v in slots.items()}
         ticks = tick_count[0]
     elapsed = time.monotonic() - start
-    display.draw(snap, n_hours_q, n_days_q, ticks, elapsed)
+    display.draw(snap, n_hours_q, n_days_q, ticks, elapsed,
+                 done_months=done_months)
 
     # ── collect results ──────────────────────────────────────────────────────
     all_ticks    = []
@@ -822,18 +833,21 @@ def check_integrity(csv_path: Path) -> dict | None:
 
 
 def print_integrity(report: dict):
-    """Print a formatted integrity report for one day."""
-    ok_str     = f"{report['ok']:2d} hours with data"
-    empty_str  = f"{report['empty']:2d} hours empty (market closed)"
-    failed_str = f"{report['failed']:2d} hours MISSING"
-
+    """Print a compact one-line integrity report for one day."""
     status = "✓" if report["failed"] == 0 else "⚠"
-    print(f"  {status}  {report['date']}  ticks: {report['total_ticks']:>8,}")
-    print(f"       ✓  {ok_str}")
-    print(f"       ○  {empty_str}")
-    if report["failed"] > 0:
-        hrs = "  ".join(f"{h:02d}:00" for h in report["failed_hours"])
-        print(f"       ✗  {failed_str}  →  {hrs}")
+    ok     = report["ok"]
+    empty  = report["empty"]
+    ticks  = report["total_ticks"]
+    date   = report["date"]
+
+    if report["failed"] == 0:
+        print(f"  {status}  {date}   {ok:2d}h data  {empty:2d}h empty"
+              f"   {ticks:>9,} ticks")
+    else:
+        failed = report["failed"]
+        hrs    = " ".join(f"{h:02d}:00" for h in report["failed_hours"])
+        print(f"  {status}  {date}   {ok:2d}h data  {empty:2d}h empty"
+              f"   {ticks:>9,} ticks   MISSING {failed}h → {hrs}")
 
 
 # ---------------------------------------------------------------------------
@@ -1082,6 +1096,8 @@ def main():
         year_total_ticks  = 0
         year_total_failed = []
 
+        done_months = [0]   # counter for months bar
+
         for m in pending_months:
             _, n_days  = calendar.monthrange(year, m)
             month_name = datetime(year, m, 1).strftime("%B %Y")
@@ -1113,12 +1129,17 @@ def main():
 
             if not pending_days:
                 print(f"  {month_name}: nothing to fetch, skipping.\n")
+                done_months[0] += 1
                 continue
 
             label = f"{year:04d}-{m:02d}"
             all_ticks, failed_pairs, hs_pairs = download_queued(
-                symbol, pending_days, label=label
+                symbol, pending_days, label=label,
+                total_months=len(pending_months),
+                done_months=done_months[0],
             )
+
+            done_months[0] += 1
 
             print()
             ticks_by_day = {}
@@ -1143,7 +1164,6 @@ def main():
                 year_total_ticks += len(day_ticks)
                 if day_failed:
                     year_total_failed.append((day, day_failed))
-                print()
 
         # ── year summary ──────────────────────────────────────────────────
         print("\n" + "=" * 55)
