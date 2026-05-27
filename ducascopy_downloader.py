@@ -14,6 +14,7 @@ Dukascopy serves one LZMA-compressed (.bi5) file per hour. Each tick is a
     float32 bid volume (in millions)
 """
 
+import calendar
 import io
 import lzma
 import os
@@ -33,12 +34,13 @@ import requests
 
 BASE_URL = "https://datafeed.dukascopy.com/datafeed"
 
-# Output directory -- created automatically if it doesn't exist.
-# Change this to any absolute or relative path you prefer.
+# Root output directory. Downloads land under:
+#   {OUTPUT_DIR}/raw/{symbol}/{YYYY_MM}/{filename}
+# A processed/ sibling is created ready for future use.
 OUTPUT_DIR = "data"
 
-# Output filename template. Iterate on this as needed.
-# Available fields: {symbol} {date} {start} {end}
+# Output filename template.
+# Available fields: {symbol} {date}
 FILENAME_TEMPLATE = "{symbol}_ticks_{date}.csv"
 
 # --- Network tuning -------------------------------------------------------
@@ -387,19 +389,36 @@ def choose_ticker() -> str:
             return symbols[0]
         if choice.isdigit() and 1 <= int(choice) <= len(symbols):
             return symbols[int(choice) - 1]
-        # also allow typing the symbol directly
         if choice.upper() in INSTRUMENTS:
             return choice.upper()
         print("  Invalid choice, try again.")
 
 
-def choose_date() -> datetime:
-    """Menu 2: enter the date to download."""
+def choose_mode() -> str:
+    """Menu 2: single day or full month."""
     print("\n" + "=" * 55)
-    print("  MENU 2 -- enter the date")
+    print("  MENU 2 -- download mode")
     print("=" * 55)
-    print("  Format: YYYY-MM-DD   (example: 2024-03-15)")
-    print("  Note: dates are UTC; weekends usually have no data.")
+    print("  1. Single day   (YYYY-MM-DD)")
+    print("  2. Full month   (YYYY-MM)")
+    print("-" * 55)
+
+    while True:
+        choice = input("Select mode [1-2] (default 1): ").strip()
+        if choice in ("", "1"):
+            return "day"
+        if choice == "2":
+            return "month"
+        print("  Invalid choice, try again.")
+
+
+def choose_date() -> datetime:
+    """Menu 3a: enter a single date."""
+    print("\n" + "=" * 55)
+    print("  MENU 3 -- enter date")
+    print("=" * 55)
+    print("  Format : YYYY-MM-DD   e.g. 2024-03-15")
+    print("  Note   : dates are UTC; weekends usually have no data.")
     print("-" * 55)
 
     while True:
@@ -411,6 +430,51 @@ def choose_date() -> datetime:
             print("  Invalid format. Use YYYY-MM-DD, e.g. 2024-03-15")
 
 
+def choose_month() -> tuple[int, int]:
+    """Menu 3b: enter a year-month, return (year, month)."""
+    print("\n" + "=" * 55)
+    print("  MENU 3 -- enter month")
+    print("=" * 55)
+    print("  Format : YYYY-MM   e.g. 2024-03")
+    print("  Note   : all days in the month will be downloaded.")
+    print("-" * 55)
+
+    while True:
+        raw = input("Enter month: ").strip()
+        try:
+            dt = datetime.strptime(raw, "%Y-%m")
+            return dt.year, dt.month
+        except ValueError:
+            print("  Invalid format. Use YYYY-MM, e.g. 2024-03")
+
+
+def _out_path(symbol: str, day: datetime) -> Path:
+    """
+    Return the full output filepath for one day's CSV.
+    Structure: {OUTPUT_DIR}/raw/{symbol}/{YYYY_MM}/{filename}
+    """
+    month_folder = day.strftime("%Y_%m")
+    filename     = FILENAME_TEMPLATE.format(
+        symbol=symbol,
+        date=day.strftime("%Y-%m-%d"),
+    )
+    out_dir = Path(OUTPUT_DIR) / "raw" / symbol / month_folder
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir / filename
+
+
+def _save_day(symbol: str, day: datetime, ticks: list, failed_hours: list):
+    """Write one day's ticks and print a per-day summary line."""
+    filepath = _out_path(symbol, day)
+    write_csv(ticks, filepath)
+
+    tick_str  = f"{len(ticks):>7,} ticks"
+    fail_str  = f"  ⚠ {len(failed_hours)} hour(s) failed: " + \
+                ", ".join(f"{h:02d}:00" for h in failed_hours) \
+                if failed_hours else ""
+    print(f"  saved  {day:%Y-%m-%d}  {tick_str}  →  {filepath}{fail_str}")
+
+
 def main():
     print("\n" + "#" * 55)
     print("#  Dukascopy raw tick data downloader")
@@ -420,47 +484,92 @@ def main():
     show_timeframes()
 
     symbol = choose_ticker()
-    day = choose_date()
+    mode   = choose_mode()
 
-    print(f"\nDownloading tick data for {symbol} on {day:%Y-%m-%d} ...")
-    ticks, failed_hours = download_day(symbol, day)
+    # ── single day ────────────────────────────────────────────────────────
+    if mode == "day":
+        day = choose_date()
+        print(f"\nDownloading {symbol}  {day:%Y-%m-%d} ...\n")
+        ticks, failed_hours = download_day(symbol, day)
 
-    if not ticks and not failed_hours:
-        print("\nNo ticks found. Check the date (weekend/holiday?) or symbol.")
-        return
+        if not ticks and not failed_hours:
+            print("\nNo ticks found. Check the date (weekend/holiday?) or symbol.")
+            return
 
-    filename = FILENAME_TEMPLATE.format(
-        symbol=symbol,
-        date=day.strftime("%Y-%m-%d"),
-        start=day.strftime("%Y%m%d"),
-        end=day.strftime("%Y%m%d"),
-    )
-    out_dir = Path(OUTPUT_DIR) / symbol
-    out_dir.mkdir(parents=True, exist_ok=True)
-    filepath = out_dir / filename
-    write_csv(ticks, filepath)
-    print(f"\nSaved {len(ticks)} ticks to: {filepath}")
-    if ticks:
-        print(f"First tick: {ticks[0][0]:%Y-%m-%d %H:%M:%S.%f}")
-        print(f"Last  tick: {ticks[-1][0]:%Y-%m-%d %H:%M:%S.%f}")
+        _save_day(symbol, day, ticks, failed_hours)
 
-    # Tell the user exactly which hours failed (vs. were just empty), so
-    # they know whether to re-run. A failed hour means a download error;
-    # an empty hour with no failures means the market was simply closed.
-    if failed_hours:
-        hrs = ", ".join(f"{h:02d}:00" for h in failed_hours)
-        print(f"\n  WARNING: {len(failed_hours)} hour(s) failed to download: {hrs}")
-        print("  These are NOT in the file. The data is incomplete.")
-        print("  Re-run for the same date to retry, or raise the timeout")
-        print("  values at the top of the script (CONNECT/READ_TIMEOUT).")
-        print("  If you are on a VPN, try turning it off for the download.")
+        if ticks:
+            print(f"\n  First tick : {ticks[0][0]:%Y-%m-%d %H:%M:%S.%f}")
+            print(f"  Last  tick : {ticks[-1][0]:%Y-%m-%d %H:%M:%S.%f}")
+
+        if failed_hours:
+            print(f"\n  WARNING: {len(failed_hours)} hour(s) missing from file.")
+            print("  Re-run this date or raise CONNECT/READ_TIMEOUT at top of script.")
+            print("  If on a VPN, try turning it off.")
+        else:
+            print("\n  All 24 hours downloaded successfully.")
+
+    # ── full month ────────────────────────────────────────────────────────
     else:
-        print("\n  All 24 hours downloaded successfully.")
-    print()
+        year, month = choose_month()
+        _, n_days   = calendar.monthrange(year, month)
+        days        = [
+            datetime(year, month, d, tzinfo=timezone.utc)
+            for d in range(1, n_days + 1)
+        ]
+
+        month_name = datetime(year, month, 1).strftime("%B %Y")
+        print(f"\n  {month_name}  →  {n_days} days  "
+              f"({days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d})")
+        print(f"  Symbol  : {symbol}")
+        print(f"  Workers : {MAX_WORKERS}")
+        print(f"  Output  : {Path(OUTPUT_DIR) / 'raw' / symbol / f'{year:04d}_{month:02d}'}/")
+        print()
+        confirm = input("  Start download? [Y/n]: ").strip().lower()
+        if confirm == "n":
+            print("  Aborted.")
+            return
+
+        print()
+        total_ticks   = 0
+        total_failed  = []   # (day, [hours])
+        skipped_days  = []   # days with zero ticks and zero failures
+
+        for i, day in enumerate(days, 1):
+            print(f"  [{i:2d}/{n_days}]  {day:%Y-%m-%d}")
+            ticks, failed_hours = download_day(symbol, day)
+
+            if not ticks and not failed_hours:
+                skipped_days.append(day)
+                print(f"         no data (weekend / holiday)")
+                continue
+
+            _save_day(symbol, day, ticks, failed_hours)
+            total_ticks += len(ticks)
+            if failed_hours:
+                total_failed.append((day, failed_hours))
+            print()
+
+        # ── month summary ─────────────────────────────────────────────────
+        print("\n" + "=" * 55)
+        print(f"  {month_name} download complete")
+        print("=" * 55)
+        print(f"  Total ticks   : {total_ticks:,}")
+        print(f"  Days skipped  : {len(skipped_days)}  (no market data)")
+
+        if total_failed:
+            print(f"  Days with gaps: {len(total_failed)}")
+            for day, hours in total_failed:
+                hrs = ", ".join(f"{h:02d}:00" for h in hours)
+                print(f"    {day:%Y-%m-%d}  missing hours: {hrs}")
+            print("\n  Re-run those dates individually to fill gaps.")
+        else:
+            print("  All days complete  ✓")
+        print()
 
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nAborted.")
+        print("\n\nAborted.")
