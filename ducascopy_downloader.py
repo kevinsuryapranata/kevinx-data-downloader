@@ -433,7 +433,7 @@ def main():
         start=day.strftime("%Y%m%d"),
         end=day.strftime("%Y%m%d"),
     )
-    out_dir = Path(OUTPUT_DIR)
+    out_dir = Path(OUTPUT_DIR) / symbol
     out_dir.mkdir(parents=True, exist_ok=True)
     filepath = out_dir / filename
     write_csv(ticks, filepath)
