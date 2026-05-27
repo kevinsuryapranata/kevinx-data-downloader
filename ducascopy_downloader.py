@@ -18,6 +18,8 @@ import io
 import lzma
 import struct
 import sys
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -99,7 +101,7 @@ def fetch_hour(symbol: str, dt: datetime):
     url = hour_url(symbol, dt)
     point = INSTRUMENTS[symbol][0]
 
-    resp = requests.get(url, timeout=30)
+    resp = requests.get(url, timeout=(10, 20))   # (connect, read) timeouts
     if resp.status_code == 404:
         return []           # no data this hour -- normal for closed markets
     resp.raise_for_status()
@@ -122,20 +124,98 @@ def fetch_hour(symbol: str, dt: datetime):
     return ticks
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    """Format a duration as MM:SS (or HH:MM:SS if long)."""
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def _progress_line(done: int, total: int, ticks: int,
+                   elapsed: float, status: str) -> str:
+    """Build a single-line progress display."""
+    width = 24
+    filled = int(width * done / total)
+    bar = "#" * filled + "-" * (width - filled)
+    pct = 100 * done / total
+    return (
+        f"\r  [{bar}] {done:2d}/{total} ({pct:3.0f}%)  "
+        f"ticks={ticks:<7d}  elapsed={_fmt_elapsed(elapsed)}  {status}   "
+    )
+
+
 def download_day(symbol: str, day: datetime):
-    """Download all 24 hours for a given calendar day (UTC)."""
+    """
+    Download all 24 hours for a given calendar day (UTC).
+
+    Each hour is fetched in a background thread so the main thread can keep
+    refreshing the progress line -- including a heartbeat at least every
+    10 seconds -- even if a single request is slow or hangs.
+    """
     all_ticks = []
-    for hour in range(24):
+    total = 24
+    start = time.monotonic()
+
+    for hour in range(total):
         dt = day.replace(hour=hour, minute=0, second=0, microsecond=0)
-        sys.stdout.write(f"\r  fetching {symbol} {dt:%Y-%m-%d} {hour:02d}:00 ...")
+
+        # Run the network fetch in a worker thread. result[0] holds the
+        # outcome: a list of ticks, or an Exception.
+        result = [None]
+
+        def worker():
+            try:
+                result[0] = fetch_hour(symbol, dt)
+            except Exception as exc:          # noqa: BLE001
+                result[0] = exc
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        # Wait for the worker, refreshing the display while it runs.
+        last_heartbeat = time.monotonic()
+        while thread.is_alive():
+            thread.join(timeout=1.0)
+            now = time.monotonic()
+            elapsed = now - start
+            # Normal refresh every second; explicit heartbeat note every 10s
+            # so a long-running hour is obviously still alive, not frozen.
+            waited = now - last_heartbeat
+            if waited >= 10:
+                status = f"working {hour:02d}:00 (still waiting...)"
+                last_heartbeat = now
+            else:
+                status = f"working {hour:02d}:00..."
+            sys.stdout.write(
+                _progress_line(hour, total, len(all_ticks), elapsed, status)
+            )
+            sys.stdout.flush()
+
+        # Worker finished -- collect its result.
+        outcome = result[0]
+        if isinstance(outcome, Exception):
+            sys.stdout.write("\r" + " " * 100 + "\r")
+            print(f"  ! error on hour {hour:02d}: {outcome}")
+            outcome = []
+        all_ticks.extend(outcome)
+
+        # Refresh the line now that this hour is done.
+        elapsed = time.monotonic() - start
+        sys.stdout.write(
+            _progress_line(hour + 1, total, len(all_ticks),
+                           elapsed, f"hour {hour:02d}:00 done")
+        )
         sys.stdout.flush()
-        try:
-            ticks = fetch_hour(symbol, dt)
-        except requests.RequestException as exc:
-            print(f"\n  ! error on hour {hour:02d}: {exc}")
-            ticks = []
-        all_ticks.extend(ticks)
-    print(f"\r  done -- {len(all_ticks)} ticks total" + " " * 20)
+
+    elapsed = time.monotonic() - start
+    sys.stdout.write(
+        _progress_line(total, total, len(all_ticks), elapsed, "complete")
+    )
+    sys.stdout.write("\n")
+    sys.stdout.flush()
     return all_ticks
 
 
