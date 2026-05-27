@@ -3,7 +3,7 @@
 Dukascopy raw tick data downloader.
 
 Downloads historical tick data from Dukascopy's public feed and writes it
-to a CSV file. Interactive CLI: pick a ticker, enter a date, get a file.
+to a Parquet file. Interactive CLI: pick a ticker, enter a date, get a file.
 
 Dukascopy serves one LZMA-compressed (.bi5) file per hour. Each tick is a
 20-byte big-endian record:
@@ -16,7 +16,6 @@ Dukascopy serves one LZMA-compressed (.bi5) file per hour. Each tick is a
 
 import calendar
 import heapq
-import io
 import lzma
 import os
 import struct
@@ -28,6 +27,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import requests
+
+try:
+    import pandas as pd
+except ImportError:
+    print("  ERROR: pandas is required.  pip install pandas pyarrow")
+    import sys; sys.exit(1)
+
+try:
+    import pyarrow  # noqa: F401
+except ImportError:
+    print("  ERROR: pyarrow is required.  pip install pyarrow")
+    import sys; sys.exit(1)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -42,7 +53,7 @@ OUTPUT_DIR = "data"
 
 # Output filename template.
 # Available fields: {symbol} {date}
-FILENAME_TEMPLATE = "{symbol}_ticks_{date}.csv"
+FILENAME_TEMPLATE = "{symbol}_ticks_{date}.parquet"
 
 # --- Network tuning -------------------------------------------------------
 # If you're on a VPN or a slow connection, raise these. Read timeouts mean
@@ -747,26 +758,28 @@ def download_day(symbol: str, day: datetime):
 # CSV / meta / integrity
 # ---------------------------------------------------------------------------
 
-def write_csv(ticks, path):
-    """Write ticks to a CSV file."""
-    with open(path, "w") as f:
-        f.write("timestamp,ask,bid,ask_volume,bid_volume\n")
-        for ts, ask, bid, ask_vol, bid_vol in ticks:
-            f.write(
-                f"{ts:%Y-%m-%d %H:%M:%S.%f},"
-                f"{ask},{bid},{ask_vol},{bid_vol}\n"
-            )
+def write_parquet(ticks, path):
+    """Write ticks to a Parquet file."""
+    import pandas as pd
+    df = pd.DataFrame(ticks,
+                      columns=["timestamp", "ask", "bid",
+                               "ask_volume", "bid_volume"])
+    df["ask"]        = df["ask"].astype("float32")
+    df["bid"]        = df["bid"].astype("float32")
+    df["ask_volume"] = df["ask_volume"].astype("float32")
+    df["bid_volume"] = df["bid_volume"].astype("float32")
+    df.to_parquet(path, engine="pyarrow", compression="snappy", index=False)
 
 
-def _meta_path(csv_path: Path) -> Path:
-    """Return the .meta.json path for a given CSV path."""
-    return csv_path.with_suffix(".meta.json")
+def _meta_path(data_path: Path) -> Path:
+    """Return the .meta.json path for a given data file path."""
+    return data_path.with_suffix(".meta.json")
 
 
-def write_meta(csv_path: Path, symbol: str, day: datetime,
+def write_meta(data_path: Path, symbol: str, day: datetime,
                ticks: list, hour_status: dict):
     """
-    Write a sidecar .meta.json alongside the CSV recording per-hour status.
+    Write a sidecar .meta.json alongside the Parquet file recording per-hour status.
 
     hour_status: {hour_int -> "ok" | "empty" | "failed"}
     """
@@ -797,20 +810,20 @@ def write_meta(csv_path: Path, symbol: str, day: datetime,
         },
     }
 
-    with open(_meta_path(csv_path), "w") as f:
+    with open(_meta_path(data_path), "w") as f:
         json.dump(meta, f, indent=2)
 
 
-def check_integrity(csv_path: Path) -> dict | None:
+def check_integrity(data_path: Path) -> dict | None:
     """
-    Read the sidecar .meta.json for a CSV and return a integrity report dict,
+    Read the sidecar .meta.json for a Parquet file and return an integrity report dict,
     or None if no meta file exists.
 
     Report keys: symbol, date, ok, empty, failed, total_ticks, failed_hours
     """
     import json
 
-    mp = _meta_path(csv_path)
+    mp = _meta_path(data_path)
     if not mp.exists():
         return None
 
@@ -856,7 +869,7 @@ def print_integrity(report: dict):
 
 def _out_path(symbol: str, day: datetime) -> Path:
     """
-    Return the full output filepath for one day's CSV.
+    Return the full output filepath for one day's Parquet file.
     Structure: {OUTPUT_DIR}/raw/{symbol}/{YYYY_MM}/{filename}
     """
     month_folder = day.strftime("%Y_%m")
@@ -871,7 +884,7 @@ def _out_path(symbol: str, day: datetime) -> Path:
 
 def _already_exists(symbol: str, day: datetime) -> bool:
     """
-    Return True if a non-empty CSV already exists for this symbol/day.
+    Return True if a non-empty Parquet file already exists for this symbol/day.
     Used to skip re-downloading files from interrupted runs.
     """
     p = _out_path(symbol, day)
@@ -882,7 +895,7 @@ def _month_complete(symbol: str, year: int, month: int,
                     cutoff: datetime) -> bool:
     """
     Return True if every tradeable day in this month (up to cutoff) already
-    has a non-empty CSV on disk. Used by the year downloader to skip months
+    has a non-empty Parquet file on disk. Used by the year downloader to skip months
     that are fully done so we never re-queue them.
 
     A month is considered complete when:
@@ -905,9 +918,9 @@ def _month_complete(symbol: str, year: int, month: int,
 
 def _save_day(symbol: str, day: datetime, ticks: list,
               failed_hours: list, hour_status: dict):
-    """Write one day's CSV + meta, then print an integrity report."""
+    """Write one day's Parquet + meta, then print an integrity report."""
     filepath = _out_path(symbol, day)
-    write_csv(ticks, filepath)
+    write_parquet(ticks, filepath)
     write_meta(filepath, symbol, day, ticks, hour_status)
 
     report = check_integrity(filepath)
@@ -1350,8 +1363,8 @@ def run_check(folder: str):
     days_with_gaps = []
 
     for mp in meta_files:
-        csv_path = mp.parent / (mp.stem.replace(".meta", "") + ".csv")
-        report   = check_integrity(csv_path)
+        data_path = mp.parent / (mp.stem.replace(".meta", "") + ".parquet")
+        report    = check_integrity(data_path)
         if report is None:
             continue
         print_integrity(report)
